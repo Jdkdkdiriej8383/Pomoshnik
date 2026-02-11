@@ -16,7 +16,7 @@ import config
 BOT_TOKEN = config.BOT_TOKEN
 TEACHER_ID = config.TEACHER_ID
 TEACHER_TIMEZONE_OFFSET = config.TEACHER_TIMEZONE_OFFSET
-DEFAULT_CHANNEL = config.CHANNEL_ID  # значение по умолчанию
+DEFAULT_CHANNEL = config.CHANNEL_ID
 
 # === БОТ И ДИСПЕТЧЕР ===
 bot = Bot(token=BOT_TOKEN)
@@ -25,14 +25,14 @@ dp = Dispatcher()
 # === СОСТОЯНИЕ БОТА ===
 bot_active = True
 
-# === ТЕКУЩИЙ КАНАЛ (будет меняться) ===
+# === ТЕКУЩИЙ КАНАЛ ===
 current_channel = DEFAULT_CHANNEL
 
 # === БАЗА ДАННЫХ ===
 conn = sqlite3.connect("school_bot.db", check_same_thread=False)
 cursor = conn.cursor()
 
-# Основная таблица пользователей
+# Таблицы
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
@@ -44,7 +44,6 @@ cursor.execute('''
     )
 ''')
 
-# Таблица для хранения message_id сообщения о дежурстве
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS duty_message (
         id INTEGER PRIMARY KEY,
@@ -52,7 +51,6 @@ cursor.execute('''
     )
 ''')
 
-# Таблица настроек (хранит текущий канал)
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -60,7 +58,7 @@ cursor.execute('''
     )
 ''')
 
-# Загружаем канал при старте
+# Загрузка настроек
 def load_setting(key: str, default: str):
     cursor.execute("SELECT value FROM settings WHERE key=?", (key,))
     row = cursor.fetchone()
@@ -72,17 +70,14 @@ def save_setting(key: str, value: str):
 
 # Инициализация канала
 current_channel = load_setting("channel", DEFAULT_CHANNEL)
-
 conn.commit()
 
-# === Функции для работы с message_id ===
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 def save_duty_message_id(message_id: int):
-    """Сохраняет ID сообщения о дежурстве"""
     cursor.execute("INSERT OR REPLACE INTO duty_message (id, message_id) VALUES (1, ?)", (message_id,))
     conn.commit()
 
 def get_duty_message_id() -> int:
-    """Получает сохранённый message_id"""
     cursor.execute("SELECT message_id FROM duty_message WHERE id=1")
     row = cursor.fetchone()
     return row[0] if row else None
@@ -97,6 +92,7 @@ class Registration(StatesGroup):
 
 # === КЛАВИАТУРЫ ===
 def get_student_kb():
+    """Клавиатура для учеников — без помощи"""
     if bot_active:
         return ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
             [KeyboardButton(text="✅ Приду в школу")],
@@ -107,13 +103,15 @@ def get_student_kb():
         return types.ReplyKeyboardRemove()
 
 def get_teacher_kb():
+    """Клавиатура для учителя — с кнопкой помощи"""
     if bot_active:
         return ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
             [KeyboardButton(text="📋 Список класса")],
             [KeyboardButton(text="➕ Добавить дежурного")],
             [KeyboardButton(text="🗑️ Удалить ученика")],
             [KeyboardButton(text="📤 Повторить отчёт в канал")],
-            [KeyboardButton(text="🔴 Стоп")]
+            [KeyboardButton(text="🔴 Стоп")],
+            [KeyboardButton(text="ℹ️ Помощь")]
         ])
     else:
         return ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
@@ -162,7 +160,7 @@ async def send_teacher_report():
     report = "\n".join(lines)
     await bot.send_message(TEACHER_ID, f"📋 Отчёт по приходу (8:25):\n\n{report}")
 
-# === УЧИТЕЛЬ ПОЛУЧАЕТ СПИСОК ДЛЯ РУЧНОГО ВЫБОРА ДЕЖУРНОГО (в 8:45) ===
+# === ВЫБОР ДЕЖУРНОГО В 8:45 ===
 async def notify_teacher_to_assign_duty():
     if not bot_active or is_weekend():
         return
@@ -184,31 +182,30 @@ async def notify_teacher_to_assign_duty():
         reply_markup=kb
     )
 
-# === ОБРАБОТЧИК ВЫБОРА ДЕЖУРНОГО ===
+# === НАЗНАЧЕНИЕ ДЕЖУРНОГО ===
 @dp.callback_query(F.data.startswith("duty_"))
 async def select_duty_student(callback: types.CallbackQuery):
+    if callback.from_user.id != TEACHER_ID:
+        await callback.answer("⛔ Только классный руководитель может назначать дежурного.")
+        return
+
     name = callback.data.split("_", 1)[1]
     cursor.execute("SELECT user_id FROM users WHERE name=?", (name,))
     row = cursor.fetchone()
 
     if row:
         user_id = row[0]
-
-        # Отправляем сообщение в канал
         msg = f"🧹 Дежурства на сегодня:\nДежурит: {name}"
         try:
             sent = await bot.send_message(current_channel, msg)
-            save_duty_message_id(sent.message_id)  # Сохраняем ID
+            save_duty_message_id(sent.message_id)
         except Exception as e:
             await bot.send_message(TEACHER_ID, f"❌ Ошибка отправки в канал <code>{current_channel}</code>: {e}", parse_mode="HTML")
-            await callback.answer("Ошибка отправки", show_alert=True)
+            await callback.answer("Ошибка", show_alert=True)
             return
 
-        # Уведомляем ученика
         await bot.send_message(user_id, "🧹 Вы назначены дежурным на сегодня! Удачи!")
-
-        # Подтверждение учителю
-        await callback.message.edit_text(f"✅ Дежурный <b>{name}</b> назначен и сообщение отправлено в канал.", parse_mode="HTML")
+        await callback.message.edit_text(f"✅ Дежурный <b>{name}</b> назначен.", parse_mode="HTML")
     else:
         await callback.message.edit_text("❌ Ученик не найден.")
 
@@ -422,10 +419,9 @@ async def start_bot(message: types.Message):
     bot_active = True
     await message.answer("🟢 Бот запущен. Ученики могут отмечаться.", reply_markup=get_teacher_kb())
 
-# === Команда: /set_channel ===
+# === Команда /set_channel ===
 @dp.message(Command("set_channel"))
 async def set_channel(message: types.Message):
-    global current_channel
     if message.from_user.id != TEACHER_ID:
         return
     args = message.text.split(maxsplit=1)
@@ -436,9 +432,43 @@ async def set_channel(message: types.Message):
     if not (channel.startswith("@") or channel.startswith("https://t.me/")):
         await message.answer("📛 Некорректное имя канала. Пример: <code>@my_school_class</code>", parse_mode="HTML")
         return
+    global current_channel
     current_channel = channel
     save_setting("channel", current_channel)
     await message.answer(f"✅ Канал изменён: {current_channel}")
+
+# === Помощь — ТОЛЬКО для учителя ===
+@dp.message(Command("help"))
+@dp.message(F.text == "ℹ️ Помощь")
+async def teacher_help(message: types.Message):
+    if message.from_user.id != TEACHER_ID:
+        return
+
+    help_text = """
+👨‍🏫 <b>Помощь для классного руководителя</b>
+
+📌 <b>Команды:</b>
+
+/start — запустить бота  
+/set_channel @канал — изменить канал для отчётов  
+/help — это сообщение
+
+📌 <b>Кнопки:</b>
+
+📋 Список класса — кто приходит/не приходит  
+➕ Добавить дежурного — вручную назначить  
+🗑️ Удалить ученика — по имени или @all  
+📤 Повторить отчёт в канал — снова отправить выбор дежурного  
+🔴 Стоп / 🟢 Старт — включить или выключить бота  
+ℹ️ Помощь — эта подсказка
+
+⏰ В 8:25 — приходит отчёт по посещаемости  
+⏰ В 8:45 — можно выбрать дежурного из пришедших
+
+🧹 После отчёта ученика — сообщение в канале меняется на "Дежурный не назначен"
+"""
+
+    await message.answer(help_text, parse_mode="HTML")
 
 # === Ученик: Команды ===
 @dp.message(F.text == "✅ Приду в школу")
@@ -476,15 +506,12 @@ async def report_duty(message: types.Message):
         await message.answer("🔴 Бот остановлен. Ожидайте.")
         return
 
-    # Отправляем подтверждение
     await message.answer("🧹 Вы отчитались о дежурстве! Молодец! 💪")
 
-    # Получаем ID сообщения в канале
     msg_id = get_duty_message_id()
     if not msg_id:
         return
 
-    # Редактируем сообщение в канале
     try:
         await bot.edit_message_text(
             chat_id=current_channel,
