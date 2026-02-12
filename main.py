@@ -32,18 +32,27 @@ current_channel = DEFAULT_CHANNEL
 conn = sqlite3.connect("school_bot.db", check_same_thread=False)
 cursor = conn.cursor()
 
-# Таблицы
+# Основная таблица пользователей
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         name TEXT,
         role TEXT,
-        status TEXT,
+        status TEXT,  -- present, absent, unknown
         reason TEXT,
         approved INTEGER DEFAULT 0
     )
 ''')
 
+# Список дежурных (очередь)
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS duty_roster (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL
+    )
+''')
+
+# Хранение message_id сообщения о дежурстве
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS duty_message (
         id INTEGER PRIMARY KEY,
@@ -51,6 +60,7 @@ cursor.execute('''
     )
 ''')
 
+# Настройки (хранение флагов)
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -58,7 +68,7 @@ cursor.execute('''
     )
 ''')
 
-# Загрузка настроек
+# === Загрузка настроек ===
 def load_setting(key: str, default: str):
     cursor.execute("SELECT value FROM settings WHERE key=?", (key,))
     row = cursor.fetchone()
@@ -70,14 +80,50 @@ def save_setting(key: str, value: str):
 
 # Инициализация канала
 current_channel = load_setting("channel", DEFAULT_CHANNEL)
-conn.commit()
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+def get_duty_list():
+    """Получить список дежурных по порядку"""
+    cursor.execute("SELECT name FROM duty_roster ORDER BY id ASC")
+    return [row[0] for row in cursor.fetchall()]
+
+def add_to_duty_roster(name: str):
+    """Добавить в конец списка"""
+    cursor.execute("INSERT INTO duty_roster (name) VALUES (?)", (name,))
+    conn.commit()
+
+def remove_from_duty_roster(name: str):
+    """Удалить из списка дежурных"""
+    cursor.execute("DELETE FROM duty_roster WHERE name=?", (name,))
+    conn.commit()
+
+def clear_duty_roster():
+    """Очистить список"""
+    cursor.execute("DELETE FROM duty_roster")
+    conn.commit()
+
+def remove_first_from_duty():
+    """Удалить и вернуть первого"""
+    names = get_duty_list()
+    if not names:
+        return None
+    first = names[0]
+    cursor.execute("DELETE FROM duty_roster WHERE rowid IN (SELECT rowid FROM duty_roster LIMIT 1)")
+    conn.commit()
+    return first
+
+def add_to_end_of_duty(name: str):
+    """Добавить в конец после отчёта"""
+    cursor.execute("INSERT INTO duty_roster (name) VALUES (?)", (name,))
+    conn.commit()
+
 def save_duty_message_id(message_id: int):
+    """Сохранить ID сообщения в канале"""
     cursor.execute("INSERT OR REPLACE INTO duty_message (id, message_id) VALUES (1, ?)", (message_id,))
     conn.commit()
 
 def get_duty_message_id() -> int:
+    """Получить сохранённый message_id"""
     cursor.execute("SELECT message_id FROM duty_message WHERE id=1")
     row = cursor.fetchone()
     return row[0] if row else None
@@ -92,7 +138,6 @@ class Registration(StatesGroup):
 
 # === КЛАВИАТУРЫ ===
 def get_student_kb():
-    """Клавиатура для учеников — без помощи"""
     if bot_active:
         return ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
             [KeyboardButton(text="✅ Приду в школу")],
@@ -103,7 +148,6 @@ def get_student_kb():
         return types.ReplyKeyboardRemove()
 
 def get_teacher_kb():
-    """Клавиатура для учителя — с кнопкой помощи"""
     if bot_active:
         return ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
             [KeyboardButton(text="📋 Список класса")],
@@ -138,78 +182,70 @@ def get_confirm_kb():
 def is_weekend():
     return datetime.now().weekday() >= 5
 
-# === ОТЧЁТ В 8:25 ===
-async def send_teacher_report():
-    if not bot_active or is_weekend():
-        return
-    cursor.execute("SELECT name, status, reason FROM users WHERE role='student' AND approved=1")
-    students = cursor.fetchall()
-    if not students:
-        await bot.send_message(TEACHER_ID, "📝 Нет зарегистрированных учеников.")
-        return
-
-    lines = []
-    for name, status, reason in students:
-        if status == "present":
-            lines.append(f"{name} — ✅ придёт")
-        elif status == "absent":
-            lines.append(f"{name} — ❌ не придёт ({reason})")
-        else:
-            lines.append(f"{name} — ❓ неизвестно")
-
-    report = "\n".join(lines)
-    await bot.send_message(TEACHER_ID, f"📋 Отчёт по приходу (8:25):\n\n{report}")
-
-# === ВЫБОР ДЕЖУРНОГО В 8:45 ===
-async def notify_teacher_to_assign_duty():
+# === НАЗНАЧЕНИЕ ДЕЖУРНОГО В 8:25 ===
+async def assign_daily_duty():
     if not bot_active or is_weekend():
         return
 
-    cursor.execute("SELECT name FROM users WHERE role='student' AND approved=1 AND status='present'")
-    present_students = [row[0] for row in cursor.fetchall()]
+    # Отмечаем, что ротация началась
+    save_setting("rotation_started", "true")
 
-    if not present_students:
-        await bot.send_message(TEACHER_ID, "🧹 Сегодня никто не приходит — дежурных нет.")
+    roster = get_duty_list()
+    if not roster:
+        await bot.send_message(TEACHER_ID, "⚠️ Список дежурных пуст.")
         return
 
-    buttons = [[InlineKeyboardButton(text=name, callback_data=f"duty_{name}")] for name in present_students]
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    # Получаем тех, кто сегодня придёт
+    cursor.execute("SELECT name FROM users WHERE status='present' AND approved=1")
+    present_names = [row[0] for row in cursor.fetchall()]
 
-    await bot.send_message(
-        TEACHER_ID,
-        "🧹 Пришло время назначить дежурного!\n\n"
-        "Выберите, кто будет дежурить сегодня:",
-        reply_markup=kb
-    )
-
-# === НАЗНАЧЕНИЕ ДЕЖУРНОГО ===
-@dp.callback_query(F.data.startswith("duty_"))
-async def select_duty_student(callback: types.CallbackQuery):
-    if callback.from_user.id != TEACHER_ID:
-        await callback.answer("⛔ Только классный руководитель может назначать дежурного.")
-        return
-
-    name = callback.data.split("_", 1)[1]
-    cursor.execute("SELECT user_id FROM users WHERE name=?", (name,))
-    row = cursor.fetchone()
-
-    if row:
-        user_id = row[0]
-        msg = f"🧹 Дежурства на сегодня:\nДежурит: {name}"
+    if not present_names:
+        msg = "🧹 Дежурства на сегодня:\nНикто не приходит."
         try:
-            sent = await bot.send_message(current_channel, msg)
-            save_duty_message_id(sent.message_id)
+            await bot.send_message(current_channel, msg)
         except Exception as e:
-            await bot.send_message(TEACHER_ID, f"❌ Ошибка отправки в канал <code>{current_channel}</code>: {e}", parse_mode="HTML")
-            await callback.answer("Ошибка", show_alert=True)
-            return
+            await bot.send_message(TEACHER_ID, f"❌ Ошибка в канале: {e}")
+        await bot.send_message(TEACHER_ID, "🚫 Сегодня никто не приходит — дежурных нет.")
+        return
 
-        await bot.send_message(user_id, "🧹 Вы назначены дежурным на сегодня! Удачи!")
-        await callback.message.edit_text(f"✅ Дежурный <b>{name}</b> назначен.", parse_mode="HTML")
-    else:
-        await callback.message.edit_text("❌ Ученик не найден.")
+    # Находим первого в списке, кто приходит
+    daily_duty = None
+    for name in roster:
+        if name in present_names:
+            daily_duty = name
+            break
 
-    await callback.answer("Готово")
+    if not daily_duty:
+        daily_duty = present_names[0]  # Если все дежурные отсутствуют
+        await bot.send_message(TEACHER_ID, f"⚠️ Назначен дежурным (из пришедших): {daily_duty}")
+
+    # Удаляем из начала очереди
+    remove_first_from_duty()
+
+    # Находим user_id
+    cursor.execute("SELECT user_id FROM users WHERE name=?", (daily_duty,))
+    row = cursor.fetchone()
+    if not row:
+        await bot.send_message(TEACHER_ID, f"❌ Ошибка: {daily_duty} не найден.")
+        return
+    user_id = row[0]
+
+    # Отправляем в канал
+    msg = f"🧹 Дежурства на сегодня:\nДежурит: {daily_duty}"
+    try:
+        sent = await bot.send_message(current_channel, msg)
+        save_duty_message_id(sent.message_id)
+    except Exception as e:
+        await bot.send_message(TEACHER_ID, f"❌ Ошибка в канале: {e}")
+
+    # Личное сообщение
+    try:
+        await bot.send_message(user_id, "🧹 Вы дежурный сегодня! Не забудьте отчитаться о дежурстве.")
+    except Exception as e:
+        await bot.send_message(TEACHER_ID, f"⚠️ Не удалось оповестить {daily_duty}: {e}")
+
+    # Уведомление учителю
+    await bot.send_message(TEACHER_ID, f"✅ Дежурный назначен: <b>{daily_duty}</b>", parse_mode="HTML")
 
 # === ПЛАНИРОВЩИК ===
 async def run_scheduler():
@@ -221,10 +257,7 @@ async def run_scheduler():
 
             if not is_weekend():
                 if hour_local == 8 and minute == 25 and second < 10:
-                    await send_teacher_report()
-                    await asyncio.sleep(60)
-                elif hour_local == 8 and minute == 45 and second < 10:
-                    await notify_teacher_to_assign_duty()
+                    await assign_daily_duty()
                     await asyncio.sleep(60)
         await asyncio.sleep(10)
 
@@ -264,8 +297,8 @@ async def process_name(message: types.Message, state: FSMContext):
         return
 
     name = message.text.strip()
-    if not re.fullmatch(r"^[А-ЯЁA-Z][а-яёa-z]*(?:[- ][А-ЯЁA-Z][а-яёa-z]+)*$", name, re.IGNORECASE):
-        await message.answer("📛 Имя: буквы, пробелы, дефисы. Пример: Анна-Мария")
+    if not re.fullmatch(r"^[А-ЯЁ][а-яё]+(?: [А-ЯЁ][а-яё]+)+$", name, re.IGNORECASE):
+        await message.answer("📛 Имя: две части, кириллица. Пример: Анна Петрова")
         return
 
     user_id = message.from_user.id
@@ -289,7 +322,27 @@ async def approve_student(callback: types.CallbackQuery):
     user_id = int(callback.data.split("_")[1])
     cursor.execute("UPDATE users SET approved=1 WHERE user_id=?", (user_id,))
     conn.commit()
-    await bot.send_message(user_id, "✅ Вы приняты!", reply_markup=get_student_kb())
+
+    cursor.execute("SELECT name FROM users WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    if not row:
+        await callback.answer("Ошибка")
+        return
+    name = row[0]
+
+    # Добавляем в список
+    add_to_duty_roster(name)
+
+    # Если это первый — ок, иначе проверим, нужно ли сортировать
+    rotation_started = load_setting("rotation_started", "false")
+    if rotation_started == "false" and len(get_duty_list()) > 1:
+        sorted_names = sorted(get_duty_list())
+        clear_duty_roster()
+        for n in sorted_names:
+            add_to_duty_roster(n)
+        await bot.send_message(TEACHER_ID, "📋 Список дежурных отсортирован по алфавиту.")
+
+    await bot.send_message(user_id, "✅ Вы приняты! Вы в списке дежурных.", reply_markup=get_student_kb())
     await callback.message.edit_text(f"{callback.message.text}\n\n✅ Принято.")
     await callback.answer("Принято")
 
@@ -301,7 +354,7 @@ async def decline_student(callback: types.CallbackQuery):
     user_id = int(callback.data.split("_")[1])
     cursor.execute("DELETE FROM users WHERE user_id=?", (user_id,))
     conn.commit()
-    await bot.send_message(user_id, "❌ Отклонено.")
+    await bot.send_message(user_id, "❌ Ваша заявка отклонена.")
     await callback.message.edit_text(f"{callback.message.text}\n\n❌ Отклонено.")
     await callback.answer("Отклонено")
 
@@ -313,18 +366,21 @@ async def list_students(message: types.Message):
     if not bot_active:
         await message.answer("🔴 Бот остановлен. Но вы можете посмотреть список.", reply_markup=get_teacher_kb())
         return
-    cursor.execute("SELECT name, status, reason FROM users WHERE role='student' AND approved=1")
+    cursor.execute("SELECT name, status, reason FROM users WHERE role='student' AND approved=1 ORDER BY name ASC")
     students = cursor.fetchall()
     if not students:
         await message.answer("📚 Класс пуст.")
         return
-    lines = [
-        f"{n} — ✅ идёт" if s == "present" else
-        f"{n} — ❌ не идёт ({r})" if s == "absent" else
-        f"{n} — ⏳ неизвестно"
-        for n, s, r in students
-    ]
-    await message.answer("👥 Список класса:\n\n" + "\n".join(lines))
+    lines = []
+    for name, status, reason in students:
+        if status == "present":
+            lines.append(f"{name} — ✅ придёт")
+        elif status == "absent":
+            lines.append(f"{name} — ❌ не придёт ({reason})")
+        else:
+            lines.append(f"{name} — ❓ неизвестно")
+    report = "\n".join(lines)
+    await message.answer(f"📋 Список класса:\n\n{report}")
 
 @dp.message(F.text == "➕ Добавить дежурного")
 async def prompt_duty_name(message: types.Message, state: FSMContext):
@@ -373,25 +429,44 @@ async def delete_student(message: types.Message, state: FSMContext):
         await message.answer("⚠️ Точно удалить всех?", reply_markup=get_confirm_kb(), parse_mode="HTML")
         await state.set_state(Registration.awaiting_delete_confirm)
     else:
+        cursor.execute("SELECT user_id FROM users WHERE name=? AND role='student'", (name,))
+        row = cursor.fetchone()
+        if row:
+            user_id = row[0]
+            try:
+                await bot.send_message(user_id, "🚫 Вы удалены из класса.", reply_markup=types.ReplyKeyboardRemove())
+            except Exception as e:
+                print(f"[Ошибка] {e}")
         cursor.execute("DELETE FROM users WHERE name=? AND role='student'", (name,))
+        remove_from_duty_roster(name)
         conn.commit()
         await message.answer(f"✅ Удалён: {name}" if cursor.rowcount else "❌ Не найден.")
         await state.clear()
 
 @dp.callback_query(F.data == "confirm_delete_all")
 async def confirm_delete_all(callback: types.CallbackQuery, state: FSMContext):
+    cursor.execute("SELECT user_id FROM users WHERE role='student'")
+    students = cursor.fetchall()
     cursor.execute("DELETE FROM users WHERE role='student'")
+    clear_duty_roster()
     conn.commit()
-    await callback.message.edit_text(f"✅ Удалено: {cursor.rowcount} учеников.")
+    for (user_id,) in students:
+        try:
+            await bot.send_message(user_id, "🚫 Все данные сброшены.", reply_markup=types.ReplyKeyboardRemove())
+        except Exception as e:
+            print(f"[Ошибка] {e}")
+    await callback.message.edit_text("✅ Все ученики и список дежурных удалены.")
     await callback.answer("Готово")
     await state.clear()
 
 @dp.callback_query(F.data == "cancel_delete")
 async def cancel_delete(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text
     await callback.message.edit_text("❌ Отменено")
     await callback.answer("Отмена")
     await state.clear()
 
+# === Повторить отчёт в канал ===
 @dp.message(F.text == "📤 Повторить отчёт в канал")
 async def resend_channel_report(message: types.Message):
     if message.from_user.id != TEACHER_ID:
@@ -399,8 +474,8 @@ async def resend_channel_report(message: types.Message):
     if not bot_active:
         await message.answer("🔴 Бот остановлен.", reply_markup=get_teacher_kb())
         return
-    await notify_teacher_to_assign_duty()
-    await message.answer("📤 Отправлено учителю для назначения.")
+    await assign_daily_duty()
+    await message.answer("📤 Запрос на назначение дежурного отправлен учителю.")
 
 # === Управление: Стоп / Старт ===
 @dp.message(F.text == "🔴 Стоп")
@@ -419,7 +494,7 @@ async def start_bot(message: types.Message):
     bot_active = True
     await message.answer("🟢 Бот запущен. Ученики могут отмечаться.", reply_markup=get_teacher_kb())
 
-# === Команда /set_channel ===
+# === Команда: /set_channel ===
 @dp.message(Command("set_channel"))
 async def set_channel(message: types.Message):
     if message.from_user.id != TEACHER_ID:
@@ -437,7 +512,7 @@ async def set_channel(message: types.Message):
     save_setting("channel", current_channel)
     await message.answer(f"✅ Канал изменён: {current_channel}")
 
-# === Помощь — ТОЛЬКО для учителя ===
+# === Помощь — только для учителя ===
 @dp.message(Command("help"))
 @dp.message(F.text == "ℹ️ Помощь")
 async def teacher_help(message: types.Message):
@@ -450,25 +525,69 @@ async def teacher_help(message: types.Message):
 📌 <b>Команды:</b>
 
 /start — запустить бота  
-/set_channel @канал — изменить канал для отчётов  
-/help — это сообщение
+/set_channel @канал — изменить канал  
+/help — это сообщение  
+/reset_duty_list — сброс к алфавиту  
+/next_duty — кто следующий в очереди
 
 📌 <b>Кнопки:</b>
 
 📋 Список класса — кто приходит/не приходит  
-➕ Добавить дежурного — вручную назначить  
+➕ Добавить дежурного — вручную  
 🗑️ Удалить ученика — по имени или @all  
-📤 Повторить отчёт в канал — снова отправить выбор дежурного  
-🔴 Стоп / 🟢 Старт — включить или выключить бота  
+📤 Повторить отчёт в канал — выбрать дежурного сейчас  
+🔴 Стоп / 🟢 Старт — включить/выключить  
 ℹ️ Помощь — эта подсказка
 
-⏰ В 8:25 — приходит отчёт по посещаемости  
-⏰ В 8:45 — можно выбрать дежурного из пришедших
-
-🧹 После отчёта ученика — сообщение в канале меняется на "Дежурный не назначен"
+⏰ В 8:25 — автоматически назначается дежурный из пришедших  
+🧹 После «отчитаться» — ученик перемещается в конец очереди
 """
 
     await message.answer(help_text, parse_mode="HTML")
+
+# === Сброс списка к алфавиту ===
+@dp.message(Command("reset_duty_list"))
+async def cmd_reset_duty_list(message: types.Message):
+    if message.from_user.id != TEACHER_ID:
+        return
+
+    names = get_duty_list()
+    if not names:
+        await message.answer("📋 Список дежурных пуст.")
+        return
+
+    # Сортируем по алфавиту
+    sorted_names = sorted(names)
+    clear_duty_roster()
+    for name in sorted_names:
+        add_to_duty_roster(name)
+
+    # Сбрасываем флаг ротации
+    save_setting("rotation_started", "false")
+
+    numbered = "\n".join([f"{i+1}. {name}" for i, name in enumerate(sorted_names)])
+    await message.answer(f"✅ Список сброшен к алфавитному порядку:\n\n{numbered}")
+
+# === Кто следующий в очереди? ===
+@dp.message(Command("next_duty"))
+async def cmd_next_duty(message: types.Message):
+    names = get_duty_list()
+    if not names:
+        await message.answer("📋 Список дежурных пуст.")
+        return
+
+    next_name = names[0]
+
+    # Проверяем статус
+    cursor.execute("SELECT status FROM users WHERE name=? AND approved=1", (next_name,))
+    row = cursor.fetchone()
+    if not row:
+        status_text = " (неизвестно)"
+    else:
+        status = row[0]
+        status_text = " ✅ придёт" if status == "present" else " ❌ не придёт" if status == "absent" else " ❓ неизвестно"
+
+    await message.answer(f"➡️ Следующий в очереди: <b>{next_name}</b>{status_text}", parse_mode="HTML")
 
 # === Ученик: Команды ===
 @dp.message(F.text == "✅ Приду в школу")
@@ -506,21 +625,29 @@ async def report_duty(message: types.Message):
         await message.answer("🔴 Бот остановлен. Ожидайте.")
         return
 
+    cursor.execute("SELECT name FROM users WHERE user_id=?", (message.from_user.id,))
+    row = cursor.fetchone()
+    if not row:
+        await message.answer("❌ Вы не зарегистрированы.")
+        return
+    name = row[0]
+
     await message.answer("🧹 Вы отчитались о дежурстве! Молодец! 💪")
 
+    # Редактируем сообщение в канале
     msg_id = get_duty_message_id()
-    if not msg_id:
-        return
+    if msg_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=current_channel,
+                message_id=msg_id,
+                text="🧹 Дежурства на сегодня:\nДежурный не назначен"
+            )
+        except Exception as e:
+            print(f"[Ошибка редактирования] {e}")
 
-    try:
-        await bot.edit_message_text(
-            chat_id=current_channel,
-            message_id=msg_id,
-            text="🧹 Дежурства на сегодня:\nДежурный не назначен"
-        )
-    except Exception as e:
-        print(f"[Ошибка редактирования] {e}")
-        await bot.send_message(TEACHER_ID, f"⚠️ Не удалось изменить сообщение в канале: {e}")
+    # Перемещаем в конец очереди
+    add_to_end_of_duty(name)
 
 # === ЗАПУСК ===
 async def main():
